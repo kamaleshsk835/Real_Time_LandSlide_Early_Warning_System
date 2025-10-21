@@ -1,0 +1,147 @@
+#include <msp430.h>
+#include <stdio.h>
+#include <string.h>
+
+#define RS BIT0
+#define EN BIT1
+#define D4 BIT4
+#define D5 BIT5
+#define D6 BIT6
+#define D7 BIT7
+#define ALERT_LED BIT6
+
+void delay_ms(unsigned int ms) { while (ms--) __delay_cycles(1000); }
+
+// ===== LCD FUNCTIONS =====
+void lcd_pulse() {
+    P2OUT |= EN;
+    __delay_cycles(2000);
+    P2OUT &= ~EN;
+    __delay_cycles(2000);
+}
+
+void lcd_send_nibble(unsigned char data) {
+    if (data & 0x10) P2OUT |= D4; else P2OUT &= ~D4;
+    if (data & 0x20) P2OUT |= D5; else P2OUT &= ~D5;
+    if (data & 0x40) P2OUT |= D6; else P2OUT &= ~D6;
+    if (data & 0x80) P2OUT |= D7; else P2OUT &= ~D7;
+    lcd_pulse();
+}
+
+void lcd_cmd(unsigned char cmd) {
+    P2OUT &= ~RS;
+    lcd_send_nibble(cmd & 0xF0);
+    lcd_send_nibble((cmd << 4) & 0xF0);
+    __delay_cycles(4000);
+}
+
+void lcd_data(unsigned char data) {
+    P2OUT |= RS;
+    lcd_send_nibble(data & 0xF0);
+    lcd_send_nibble((data << 4) & 0xF0);
+    __delay_cycles(4000);
+}
+
+void lcd_init() {
+    P2DIR |= RS | EN | D4 | D5 | D6 | D7;
+    __delay_cycles(15000);
+    lcd_send_nibble(0x30);
+    lcd_send_nibble(0x30);
+    lcd_send_nibble(0x30);
+    lcd_send_nibble(0x20);
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_cmd(0x01);
+}
+
+void lcd_str(char *s) { while (*s) lcd_data(*s++); }
+
+// ===== UART FUNCTIONS =====
+void uart_init() {
+    P1SEL |= BIT1 + BIT2;
+    P1SEL2 |= BIT1 + BIT2;
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;              // 1 MHz -> 9600 baud
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx_char(char c) {
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_tx_str(char *s) {
+    while (*s) uart_tx_char(*s++);
+}
+
+// ===== ADC FUNCTION =====
+unsigned int read_adc(unsigned int channel) {
+    ADC10CTL1 = channel << 12;
+    ADC10CTL0 = SREF_0 + ADC10SHT_3 + ADC10ON;
+    __delay_cycles(1000);
+    ADC10CTL0 |= ENC + ADC10SC;
+    while (ADC10CTL1 & ADC10BUSY);
+    return ADC10MEM;
+}
+
+// ===== MAIN =====
+int main(void) {
+    WDTCTL = WDTPW | WDTHOLD;
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+
+    P1DIR |= ALERT_LED;
+    P1OUT &= ~ALERT_LED;
+
+    lcd_init();
+    uart_init();
+
+    unsigned int temp_raw, moist_raw, water_raw;
+    unsigned int vibration, gyro;
+    float tempC, moist_per, water_lvl;
+    char msg[80];
+
+    while (1) {
+        temp_raw = read_adc(0);          // P1.0 - LM35
+        moist_raw = read_adc(2);         // P1.2 - Moisture
+        water_raw = read_adc(4);         // P1.4 - Water level
+        vibration = (P1IN & BIT1) ? 1 : 0;
+        gyro = (P1IN & BIT3) ? 1 : 0;
+
+        tempC = (temp_raw * 3.3 / 1023) * 100;
+        moist_per = (moist_raw / 1023.0) * 100;
+        water_lvl = (water_raw / 1023.0) * 100;
+
+        lcd_cmd(0x01);
+        lcd_cmd(0x80);
+        lcd_str("T:");
+        char buf[16];
+        sprintf(buf, "%.1fC M:%.0f%%", tempC, moist_per);
+        lcd_str(buf);
+        lcd_cmd(0xC0);
+        sprintf(buf, "W:%.0f%% V:%d G:%d", water_lvl, vibration, gyro);
+        lcd_str(buf);
+
+        sprintf(msg, "Temp:%.1fC | Moist:%.0f%% | Water:%.0f%% | Vib:%d | Gyro:%d\r\n",
+                tempC, moist_per, water_lvl, vibration, gyro);
+        uart_tx_str(msg);
+
+        if (tempC > 45 || moist_per > 80 || water_lvl > 70 || vibration || gyro) {
+            P1OUT |= ALERT_LED;
+            uart_tx_str("ALERT: Stage 3 - Critical Landslide Risk!\r\n");
+        } else if (tempC > 35 || moist_per > 60 || water_lvl > 50) {
+            P1OUT |= ALERT_LED;
+            uart_tx_str("ALERT: Stage 2 - Warning Zone\r\n");
+        } else if (tempC > 30 || moist_per > 40) {
+            P1OUT |= ALERT_LED;
+            uart_tx_str("ALERT: Stage 1 - Caution\r\n");
+        } else {
+            P1OUT &= ~ALERT_LED;
+        }
+
+        delay_ms(1000);
+    }
+}
